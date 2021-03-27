@@ -1,0 +1,135 @@
+#!/usr/bin/python3 -u
+#
+# CS3700, Spring 2015
+# Project 2 Starter Code
+#
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+MSG_SIZE = 1500
+TIMEOUT = 30
+NUM_FIN = 5
+
+# Bind to localhost and an ephemeral port
+UDP_IP = "127.0.0.1"
+UDP_PORT = int(sys.argv[1])
+
+
+# Sequence number for acked
+SEQUENCE = 0
+# Store for packets
+PACKETS = {}
+# Flag to finish the connection between server and client
+EOF = False
+
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+sock.bind((UDP_IP, UDP_PORT))
+sock.settimeout(TIMEOUT)
+
+# Get port we bound to
+UDP_PORT = sock.getsockname()[1]
+log("[bound] " + str(UDP_PORT))
+
+
+def inc_seq(seq, data = None):
+  ''' function for generating the right seq number '''
+  length = 0 if data is None else len(data)
+  return (seq + length) % (2 ** 32 - 1)
+
+
+# Now listen for packets
+while True:
+  result = sock.recvfrom(MSG_SIZE)
+
+  # If nothing is ready, we hit the timeout
+  if result:
+    (data, addr) = result
+    try:
+      decoded = json.loads(bytes.decode(data))
+      seq = decoded['sequence']
+
+      # If the EOF flag is set, exit
+      #if (decoded['eof']):
+      #  log("[completed]")
+      #  sys.exit(0)
+
+      EOF = decoded.get('eof') or EOF
+      length = 0 if decoded['data'] is None else len(decoded['data'])
+
+      if decoded.get('syn'):
+        if decoded.get('ack'):
+          log('[recv syn ack] handshake finish')
+        else:
+          log("[recv syn] " + str(seq))
+          SEQUENCE = inc_seq(seq + 1)
+          msg = json.dumps({'syn': seq, 'ack': SEQUENCE})
+
+          # Send back an ack to the sender
+          log('ABOUT TO SEND ' + msg)
+          if sock.sendto(str.encode(msg), addr) < len(msg):
+            log("[error] unable to fully send packet")
+
+          continue
+
+      # If there is data and in order, we accept it and print it out
+      if decoded.get('data') and decoded['sequence'] == SEQUENCE:
+        log("[recv data] " + str(decoded['sequence']) + " (" + str(length) + ") ACCEPTED (in-order)")
+        sys.stdout.write(decoded['data'])
+        SEQUENCE = inc_seq(seq, data)       
+        msg = json.dumps({'ack': SEQUENCE})
+
+        # Send back an ack to the sender
+        log("ABOUT TO SEND " + msg)
+        if sock.sendto(str.encode(msg), addr) < len(msg):
+          log("[error] unable to fully send packet")
+        
+        while SEQUENCE in PACKETS:
+          msg = PACKETS.pop(SEQUENCE)
+          sys.stdout.write(msg)
+          SEQUENCE = inc_seq(SEQUENCE, msg)
+
+      # If there is data but out of order
+      elif decoded['sequence'] > SEQUENCE and decoded['sequence'] not in PACKETS:
+        log("[recv data] " + str(decoded['sequence']) + " (" + str(length) + ") ACCEPTED (out-of-order)")
+        PACKETS[seq] = decoded['data']
+        msg = json.dumps({'ack': inc_seq(seq + length)}
+)
+        # Send back an ack to the sender
+        log("ABOUT TO SEND " + msg)
+        if sock.sendto(str.encode(msg), addr) < len(msg):
+          log("[error] unable to fully send packet")
+     
+      # If there is data but duplicated
+      else:
+        log("IGNORE duplicate")
+        msg = json.dumps({'ack': seq + length})
+        
+        # Send back an ack to the sender
+        log("ABOUT TO SEND " + msg)
+        if sock.sendto(str.encode(msg), addr) < len(msg):
+          log("[error] unable to fully send packet")
+
+      if EOF and len(PACKETS) == 0:
+        log('[completed]')
+        #for i in range(NUM_FIN):
+        #  msg = json.dumps({'ack': decoded['sequence'], 'syn': decoded['sequence']})
+        #  if sock.sendto(msg.encode('ascii'), addr) < len(msg):
+        #    log("[error] unable to fully send packet")
+        sys.exit(0)
+
+    except (ValueError, KeyError, TypeError) as e:
+      log("[recv corrupt packet]")
+      raise e
+  else:
+    log("[error] timeout")
+    sys.exit(-1)

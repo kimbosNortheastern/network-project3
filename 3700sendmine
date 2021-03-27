@@ -1,0 +1,240 @@
+#!/usr/bin/python3 -u
+#
+# CS3700, Spring 2015
+# Project 2 Starter Code
+#
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+import random
+import math
+import base64
+
+MSG_SIZE = 1500
+DATA_SIZE = 500 # 1500byte MTU - 20 byte IP Header - 8byte UDP header 1472
+TIMEOUT = 30
+SEQUENCE = random.randrange(0, 2 ** 32) # Generate sequence number from 0 to 2^32 - 1 inclusive
+
+#
+SEND = {}
+READ = {}
+
+# RTT, but start unknown
+RTT = None
+# Congestion window
+CONGESTION = 1
+# Slow start threshold
+SLOW_START = 4
+# FLAG FOR EOF
+EOF = False
+# Duplicated Ack
+DUP = 0
+# ALPHA value for calculating rtt
+ALPHA = 0.85
+
+# Bind to localhost and an ephemeral port
+IP_PORT = sys.argv[1]
+UDP_IP = IP_PORT[0:IP_PORT.find(":")]
+UDP_PORT = int(IP_PORT[IP_PORT.find(":")+1:])
+dest = (UDP_IP, UDP_PORT)
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+sock.settimeout(TIMEOUT)
+
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+
+def inc_seq(seq, data = None):
+  ''' Increase the Sequence number by using given data '''
+  length = 0 if data is None else len(data)
+  return (seq + length) % (2 ** 32 - 1)
+  
+
+def send_packet(msg):
+  ''' Send packet by changing the given message  '''
+  temp = {'sequence': SEQUENCE, 'data': None, 'syn': False, 'ack': False, 'eof': False}
+ 
+  for key, value in msg.items():
+    temp[key] = value
+
+  new_msg = str.encode(json.dumps(temp))
+ 
+  log('[Send Packet]: {}'.format(sys.getsizeof(new_msg)))
+
+  if sock.sendto(new_msg, dest) < len(new_msg):
+    log("[error] unable to fully send packet")
+  else:
+    if temp['data'] is None:
+      length = 0
+    else:
+      length = len(temp['data'])
+    log("[send data] " + str(SEQUENCE) + " (" + str(length) + ")")
+    
+
+
+def send_packets():
+  ''' Send packets '''  
+  global SEND
+  global READ
+
+  while len(SEND) < CONGESTION and len(READ) > 0:
+    num = min(READ)
+    msg = READ.pop(num)
+    msg['time'] = time.time()
+    msg['rto'] = TIMEOUT
+    SEND[num] = msg
+    send_packet(msg)
+
+
+def read_packets():
+  ''' Read packets '''
+  global SEQUENCE
+  global READ
+  global EOF
+
+  if EOF:
+    return
+
+  for i in range(int(math.floor(CONGESTION) - len(READ))):
+    data = sys.stdin.read(DATA_SIZE)
+    log("SEND read packets: {}".format(sys.getsizeof(data)))
+    log("Send read packets data size: {}".format(len(data)))
+
+    if (len(data) > 0):
+      EOF = len(data) < DATA_SIZE
+      msg = {'sequence': SEQUENCE, 'data': data, 'eof': len(data) < DATA_SIZE}
+      SEQUENCE = inc_seq(SEQUENCE, data)
+      READ[SEQUENCE] = msg
+
+    else:
+      msg = {'eof': True, 'data': data}
+      send_packet(msg)
+      log("Send read packets eof: {}".format(len(data)))
+      EOF = True
+
+    if EOF:
+      break
+
+
+def check_handshake():
+  global SEQUENCE
+  
+  # send the first packet which is syn True msg
+  msg = {'syn': True}
+  send_packet(msg)
+ 
+  result = sock.recvfrom(MSG_SIZE)
+
+  if result:
+    (data, addr) = result
+    try:
+      decoded = json.loads(bytes.decode(data))
+      seq = inc_seq(SEQUENCE + 1)
+
+      if decoded.get('ack') == seq and decoded.get('syn') is not None:
+        SEQUENCE = inc_seq(SEQUENCE + 1) 
+        log("[recv ack] " + str(SEQUENCE))
+        msg = {'ack': decoded['syn'] + 1, 'syn': True}
+        send_packet(msg)
+        return True
+      else:
+        log("[error] syn and ack mismatch [syn]: " + str(decoded.get('syn')) + " [ack] " + str(decoded.get('ack')))
+        return False
+    except (ValueError, KeyError, TypeError):
+      log("[recv corrupt packet]")
+  else:
+    log("[error] timeout")
+    return False
+     
+
+    
+
+# Send first packet (handshake)
+start = time.time()
+while not check_handshake():
+  continue
+RTT = time.time() - start
+TIEMOUT = 2 * RTT
+
+
+# Now read in data, send packets
+while True:
+
+  read_packets()
+  send_packets()
+
+  log("ABOUT TO SLEEP")
+
+  ready = select.select([sock], [], [], TIMEOUT)
+
+  if ready[0]:
+    result = sock.recvfrom(MSG_SIZE)
+
+    if result:
+      (data, addr) = result
+
+      try:
+        decoded = json.loads(bytes.decode(data))
+
+        # If there is an ack, send next packet
+        if decoded['ack'] in SEND:
+          log("[recv ack] " + str(SEQUENCE))
+          DUP = 0
+          p = SEND.pop(decoded['ack'])
+
+          # set RTT
+          temp = time.time() - p['time']
+          RTT = ALPHA * RTT + ((1 - ALPHA) * temp)
+          TIMEOUT = 2 * RTT
+
+          # set CWND
+          temp = CONGESTION + 1
+          if CONGESTION < SLOW_START:
+            CONGESTION = temp
+          else:
+            CONGESTION = temp / CONGESTION
+
+        if EOF and len(SEND) == 0 and len(READ) == 0:
+          #sock.sendto(json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}), dest)
+          log('send complete')
+          sys.exit(0)
+
+        elif decoded.get('ack'):
+          DUP += 1
+
+          if DUP == 3:
+            DUP = 0
+
+            # retransmit
+            READ.update(SEND)
+            SEND = {}
+            send_packets()
+            CONGESTION = SLOW_START / 2
+        
+      except (ValueError, KeyError, TypeError):
+        log("[recv corrupt packet]")
+    else:
+      log("[error] timeout")
+      sys.exit(-1)
+  else:
+    SLOW_START = CONGESTION / 2
+    CONGESTION = 1
+    RTT = (ALPHA * RTT) + ((1 - ALPHA) * TIMEOUT)
+    TIMEOUT = 2 * RTT
+    log('[New TIMEOUT] :' + str(TIEMOUT))
+
+    READ.update(SEND)
+    SEND = {}
+    send_packets()
+    
+    
+
+#sock.sendto(json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}), dest)
+#sys.exit(0)
